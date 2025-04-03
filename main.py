@@ -4,6 +4,7 @@ import numpy as np
 import os
 import time
 from scipy.spatial import distance
+from threading import Thread
 
 # Configuration
 KNOWN_FACES_DIR = "faces_to_know"
@@ -12,20 +13,17 @@ EYE_AR_THRESHOLD = 0.25
 MOUTH_AR_THRESHOLD = 0.85
 RECOGNITION_THRESHOLD = 0.5
 
-
 def eye_aspect_ratio(eye):
-    A = distance.euclidean(eye[1], eye[5])
-    B = distance.euclidean(eye[2], eye[4])
-    C = distance.euclidean(eye[0], eye[3])
-    return (A + B) / (2.0 * C)
-
+    a = distance.euclidean(eye[1], eye[5])
+    b = distance.euclidean(eye[2], eye[4])
+    c = distance.euclidean(eye[0], eye[3])
+    return (a + b) / (2.0 * c)
 
 def mouth_aspect_ratio(mouth):
-    A = distance.euclidean(mouth[2], mouth[10])
-    B = distance.euclidean(mouth[4], mouth[8])
-    C = distance.euclidean(mouth[0], mouth[6])
-    return (A + B) / (2.0 * C)
-
+    a = distance.euclidean(mouth[2], mouth[10])
+    b = distance.euclidean(mouth[4], mouth[8])
+    c = distance.euclidean(mouth[0], mouth[6])
+    return (a + b) / (2.0 * c)
 
 def load_known_faces():
     global known_face_encodings, known_face_names
@@ -54,23 +52,27 @@ def load_known_faces():
             if valid_encodings == 0:
                 print(f"Warning: No valid encodings found for {person_name}")
 
-
 def enroll_new_person():
+    global top, bottom, left, right
     name = input("Enter the person's name: ").strip()
     if not name:
         print("Invalid name, enrollment canceled")
         return
 
     person_dir = os.path.join(KNOWN_FACES_DIR, name)
-    os.makedirs(person_dir, exist_ok=True)
+    if not os.path.exists(person_dir):
+        print("This person is not enrolled yet. Starting new enrollment.")
+        os.makedirs(person_dir, exist_ok=True)
+
+    existing_images = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
+    captured_count = len(existing_images)
+    new_images_to_capture = 10
 
     cap = cv2.VideoCapture(0)
     pose_index = 0
     last_capture = 0
-    enrollment_done = False
-    captured_count = 0
 
-    while not enrollment_done:
+    while new_images_to_capture > 0:
         ret, frame = cap.read()
         if not ret:
             break
@@ -90,24 +92,19 @@ def enroll_new_person():
             sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
             brightness = np.mean(gray)
 
-            if (face_ratio > 0.1 and
-                    sharpness > 100 and
-                    100 < brightness < 200):
+            if face_ratio > 0.1 and sharpness > 100 and 100 < brightness < 200:
                 quality_ok = True
                 color = (0, 255, 0)
             else:
                 color = (0, 0, 255)
 
-            cv2.rectangle(frame,
-                          (left * 4, top * 4),
-                          (right * 4, bottom * 4),
-                          color, 2)
+            cv2.rectangle(frame, (left * 4, top * 4), (right * 4, bottom * 4), color, 2)
 
         cv2.putText(frame, f"Pose: {ENROLLMENT_POSES[pose_index]}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(frame, f"Captured: {captured_count}/20 | Brightness: {brightness:.1f}", (10, 60),
+        cv2.putText(frame, f"Captured: {captured_count} | Brightness: {brightness:.1f}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame, "Hold still for auto-capture", (10, frame.shape[0] - 10),
+        cv2.putText(frame, f"Remaining: {new_images_to_capture}", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         if quality_ok and (time.time() - last_capture) > 1.5:
@@ -115,11 +112,9 @@ def enroll_new_person():
             filename = os.path.join(person_dir, f"{ENROLLMENT_POSES[pose_index]}_{captured_count}.jpg")
             cv2.imwrite(filename, face_image)
             captured_count += 1
+            new_images_to_capture -= 1
             last_capture = time.time()
             pose_index = (pose_index + 1) % len(ENROLLMENT_POSES)
-
-            if captured_count >= 20:
-                enrollment_done = True
 
         cv2.imshow("Face Enrollment", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -127,33 +122,18 @@ def enroll_new_person():
 
     cap.release()
     cv2.destroyAllWindows()
+    print(f"Added 10 new images for {name}.")
 
-
-# Initialize face database
-os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
-load_known_faces()
-
-# Main recognition loop
-video_capture = cv2.VideoCapture(0)
-
-while True:
-    ret, frame = video_capture.read()
-    if not ret:
-        break
-
-    frame = cv2.flip(frame, 1)
+def process_frame(frame, known_face_encodings, known_face_names):
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
     rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-    # Process every other frame to speed up
     face_locations = face_recognition.face_locations(rgb_small_frame)
     face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
     face_landmarks_list = face_recognition.face_landmarks(rgb_small_frame, face_locations)
 
     face_names = []
-    # Modified recognition section in the main loop
     for (encoding, landmarks) in zip(face_encodings, face_landmarks_list):
-        # Liveness check
         left_eye = landmarks['left_eye']
         right_eye = landmarks['right_eye']
         mouth = landmarks['top_lip'] + landmarks['bottom_lip']
@@ -163,7 +143,6 @@ while True:
 
         liveness = "Real" if ear < EYE_AR_THRESHOLD and mar < MOUTH_AR_THRESHOLD else "Spoof"
 
-        # Only attempt recognition if we have known faces
         if known_face_encodings:
             face_distances = face_recognition.face_distance(known_face_encodings, encoding)
             best_match_index = np.argmin(face_distances)
@@ -177,29 +156,49 @@ while True:
 
         face_names.append(f"{name} ({liveness})")
 
-    # Display results
-    for (top, right, bottom, left), name in zip(face_locations, face_names):
-        top *= 4;
-        right *= 4;
-        bottom *= 4;
-        left *= 4
-        color = (0, 255, 0) if "Real" in name else (0, 0, 255)
+    return face_locations, face_names
 
-        cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-        cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
-        cv2.putText(frame, name, (left + 6, bottom - 6),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+def recognition_thread(video_capture, known_face_encodings, known_face_names):
+    while True:
+        ret, frame = video_capture.read()
+        if not ret:
+            break
 
-    cv2.imshow('Face Recognition System', frame)
+        frame = cv2.flip(frame, 1)
 
-    key = cv2.waitKey(1)
-    if key == ord('a'):
-        video_capture.release()
-        enroll_new_person()
-        video_capture = cv2.VideoCapture(0)
-        load_known_faces()
-    elif key in [ord('q'), 27]:  # 27 = ESC
-        break
+        face_locations, face_names = process_frame(frame, known_face_encodings, known_face_names)
 
-video_capture.release()
-cv2.destroyAllWindows()
+        for (top, right, bottom, left), name in zip(face_locations, face_names):
+            top *= 4
+            right *= 4
+            bottom *= 4
+            left *= 4
+            color = (0, 255, 0) if "Real" in name else (0, 0, 255)
+
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
+            cv2.putText(frame, name, (left + 6, bottom - 6),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+
+        cv2.imshow('Face Recognition System', frame)
+
+        key = cv2.waitKey(1)
+        if key == ord('a'):
+            video_capture.release()
+            enroll_new_person()
+            video_capture = cv2.VideoCapture(0)
+            load_known_faces()
+        elif key in [ord('q'), 27]:
+            break
+
+    video_capture.release()
+    cv2.destroyAllWindows()
+
+# Initialize face database
+os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+load_known_faces()
+
+# Main recognition loop
+video_capture = cv2.VideoCapture(0)
+recognition_thread = Thread(target=recognition_thread, args=(video_capture, known_face_encodings, known_face_names))
+recognition_thread.start()
