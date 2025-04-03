@@ -3,27 +3,12 @@ import cv2
 import numpy as np
 import os
 import time
-from scipy.spatial import distance
 from threading import Thread
 
 # Configuration
 KNOWN_FACES_DIR = "faces_to_know"
 ENROLLMENT_POSES = ['front', 'left', 'right', 'up', 'down']
-EYE_AR_THRESHOLD = 0.25
-MOUTH_AR_THRESHOLD = 0.85
 RECOGNITION_THRESHOLD = 0.5
-
-def eye_aspect_ratio(eye):
-    a = distance.euclidean(eye[1], eye[5])
-    b = distance.euclidean(eye[2], eye[4])
-    c = distance.euclidean(eye[0], eye[3])
-    return (a + b) / (2.0 * c)
-
-def mouth_aspect_ratio(mouth):
-    a = distance.euclidean(mouth[2], mouth[10])
-    b = distance.euclidean(mouth[4], mouth[8])
-    c = distance.euclidean(mouth[0], mouth[6])
-    return (a + b) / (2.0 * c)
 
 def load_known_faces():
     global known_face_encodings, known_face_names
@@ -130,19 +115,9 @@ def process_frame(frame, known_face_encodings, known_face_names):
 
     face_locations = face_recognition.face_locations(rgb_small_frame)
     face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-    face_landmarks_list = face_recognition.face_landmarks(rgb_small_frame, face_locations)
 
     face_names = []
-    for (encoding, landmarks) in zip(face_encodings, face_landmarks_list):
-        left_eye = landmarks['left_eye']
-        right_eye = landmarks['right_eye']
-        mouth = landmarks['top_lip'] + landmarks['bottom_lip']
-
-        ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
-        mar = mouth_aspect_ratio(mouth)
-
-        liveness = "Real" if ear < EYE_AR_THRESHOLD and mar < MOUTH_AR_THRESHOLD else "Spoof"
-
+    for encoding in face_encodings:
         if known_face_encodings:
             face_distances = face_recognition.face_distance(known_face_encodings, encoding)
             best_match_index = np.argmin(face_distances)
@@ -154,7 +129,7 @@ def process_frame(frame, known_face_encodings, known_face_names):
         else:
             name = "Unknown (No registered faces)"
 
-        face_names.append(f"{name} ({liveness})")
+        face_names.append(name)
 
     return face_locations, face_names
 
@@ -173,7 +148,7 @@ def recognition_thread(video_capture, known_face_encodings, known_face_names):
             right *= 4
             bottom *= 4
             left *= 4
-            color = (0, 255, 0) if "Real" in name else (0, 0, 255)
+            color = (0, 255, 0)  # Always green for recognized faces
 
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
             cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
