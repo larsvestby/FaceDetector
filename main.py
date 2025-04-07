@@ -7,6 +7,7 @@ from scipy.spatial import distance
 from threading import Thread
 
 # Configuration
+FACE_DETECTION_MODEL = 'hog'
 KNOWN_FACES_DIR = "faces_to_know"
 ENROLLMENT_POSES = ['front', 'left', 'right', 'up', 'down']
 EYE_AR_THRESHOLD = 0.25
@@ -41,7 +42,15 @@ def load_known_faces():
                 image_path = os.path.join(person_dir, filename)
                 try:
                     image = face_recognition.load_image_file(image_path)
-                    encodings = face_recognition.face_encodings(image)
+                    face_locations = face_recognition.face_locations(
+                        image,
+                        model=FACE_DETECTION_MODEL
+                    )
+                    encodings = face_recognition.face_encodings(
+                        image,
+                        face_locations,
+                        num_jitters=5
+                    )
                     if encodings:
                         known_face_encodings.append(encodings[0])
                         known_face_names.append(person_name)
@@ -81,7 +90,10 @@ def enroll_new_person():
         small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
         rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-        face_locations = face_recognition.face_locations(rgb_small_frame)
+        face_locations = face_recognition.face_locations(
+            rgb_small_frame,
+            model=FACE_DETECTION_MODEL
+        )
         quality_ok = False
         brightness = 0
 
@@ -110,7 +122,7 @@ def enroll_new_person():
         if quality_ok and (time.time() - last_capture) > 1.5:
             face_image = frame[top * 4:bottom * 4, left * 4:right * 4]
             filename = os.path.join(person_dir, f"{ENROLLMENT_POSES[pose_index]}_{captured_count}.jpg")
-            cv2.imwrite(filename, face_image)
+            cv2.imwrite(filename, face_image, [cv2.IMWRITE_JPEG_QUALITY, 95])
             captured_count += 1
             new_images_to_capture -= 1
             last_capture = time.time()
@@ -128,11 +140,21 @@ def process_frame(frame, known_face_encodings, known_face_names):
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
     rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-    face_locations = face_recognition.face_locations(rgb_small_frame)
-    face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-    face_landmarks_list = face_recognition.face_landmarks(rgb_small_frame, face_locations)
+    face_locations = face_recognition.face_locations(
+        rgb_small_frame,
+        model=FACE_DETECTION_MODEL
+    )
+    face_encodings = face_recognition.face_encodings(
+        rgb_small_frame,
+        face_locations,
+        num_jitters=3
+    )
+    face_landmarks_list = face_recognition.face_landmarks(
+        rgb_small_frame,
+        face_locations
+    )
 
-    face_names = []
+    face_info = []
     for (encoding, landmarks) in zip(face_encodings, face_landmarks_list):
         left_eye = landmarks['left_eye']
         right_eye = landmarks['right_eye']
@@ -140,23 +162,31 @@ def process_frame(frame, known_face_encodings, known_face_names):
 
         ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
         mar = mouth_aspect_ratio(mouth)
-
         liveness = "Real" if ear < EYE_AR_THRESHOLD and mar < MOUTH_AR_THRESHOLD else "Spoof"
+
+        name = "Unknown"
+        confidence = None
 
         if known_face_encodings:
             face_distances = face_recognition.face_distance(known_face_encodings, encoding)
             best_match_index = np.argmin(face_distances)
+            min_distance = face_distances[best_match_index]
 
-            if face_distances[best_match_index] < RECOGNITION_THRESHOLD:
+            if min_distance < RECOGNITION_THRESHOLD:
                 name = known_face_names[best_match_index]
+                confidence = round((1 - min_distance) * 100)
             else:
                 name = "Unknown"
         else:
             name = "Unknown (No registered faces)"
 
-        face_names.append(f"{name} ({liveness})")
+        face_info.append({
+            'name': name,
+            'confidence': confidence,
+            'liveness': liveness
+        })
 
-    return face_locations, face_names
+    return face_locations, face_info
 
 def recognition_thread(video_capture, known_face_encodings, known_face_names):
     while True:
@@ -165,20 +195,34 @@ def recognition_thread(video_capture, known_face_encodings, known_face_names):
             break
 
         frame = cv2.flip(frame, 1)
+        face_locations, face_info = process_frame(frame, known_face_encodings, known_face_names)
 
-        face_locations, face_names = process_frame(frame, known_face_encodings, known_face_names)
-
-        for (top, right, bottom, left), name in zip(face_locations, face_names):
+        # Draw face boxes and labels
+        for (top, right, bottom, left), info in zip(face_locations, face_info):
             top *= 4
             right *= 4
             bottom *= 4
             left *= 4
-            color = (0, 255, 0) if "Real" in name else (0, 0, 255)
+            color = (0, 255, 0) if info['liveness'] == "Real" else (0, 0, 255)
 
+            # Create label text
+            if info['confidence'] is not None:
+                label = f"{info['name']} {info['confidence']}%"
+            else:
+                label = info['name']
+
+            # Draw bounding box and label
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
             cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
-            cv2.putText(frame, name, (left + 6, bottom - 6),
+            cv2.putText(frame, label, (left + 6, bottom - 6),
                         cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+
+        # Display liveness status in corner
+        if face_info:
+            liveness_statuses = [f"{info['liveness']}" for info in face_info]
+            liveness_text = "Status: " + ", ".join(liveness_statuses)
+            cv2.putText(frame, liveness_text, (10, frame.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         cv2.imshow('Face Recognition System', frame)
 
