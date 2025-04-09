@@ -3,16 +3,25 @@ import cv2
 import numpy as np
 import os
 import time
+import pickle
 from scipy.spatial import distance
-from threading import Thread
+from threading import Thread, Lock
+from concurrent.futures import ThreadPoolExecutor
 
 # Configuration
 FACE_DETECTION_MODEL = 'hog'
 KNOWN_FACES_DIR = "faces_to_know"
+CACHE_FILE = "known_faces_cache.pkl"
 ENROLLMENT_POSES = ['front', 'left', 'right', 'up', 'down']
 EYE_AR_THRESHOLD = 0.25
 MOUTH_AR_THRESHOLD = 0.85
 RECOGNITION_THRESHOLD = 0.5
+PROCESS_INTERVAL = 1
+RESIZE_FACTOR = 0.5
+
+latest_face_info = []
+face_info_lock = Lock()
+encoding_executor = ThreadPoolExecutor(max_workers=1)
 
 def eye_aspect_ratio(eye):
     a = distance.euclidean(eye[1], eye[5])
@@ -26,13 +35,19 @@ def mouth_aspect_ratio(mouth):
     c = distance.euclidean(mouth[0], mouth[6])
     return (a + b) / (2.0 * c)
 
-def load_known_faces():
-    global known_face_encodings, known_face_names
+def save_known_faces(known_face_encodings, known_face_names):
+    with open(CACHE_FILE, "wb") as f:
+        pickle.dump({
+            "encodings": known_face_encodings,
+            "names": known_face_names
+        }, f)
+
+def build_known_faces():
     known_face_encodings = []
     known_face_names = []
 
     if not os.path.exists(KNOWN_FACES_DIR):
-        return
+        return known_face_encodings, known_face_names
 
     for person_name in os.listdir(KNOWN_FACES_DIR):
         person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
@@ -57,9 +72,31 @@ def load_known_faces():
                         valid_encodings += 1
                 except Exception as e:
                     print(f"Error loading {image_path}: {str(e)}")
-
             if valid_encodings == 0:
                 print(f"Warning: No valid encodings found for {person_name}")
+    return known_face_encodings, known_face_names
+
+def load_known_faces(force_rebuild=False):
+    global known_face_encodings, known_face_names
+    known_face_encodings = []
+    known_face_names = []
+
+    # If force_rebuild is True, ignore the cache and rebuild it.
+    if not force_rebuild and os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                data = pickle.load(f)
+                known_face_encodings = data.get("encodings", [])
+                known_face_names = data.get("names", [])
+            print("Loaded known faces from cache.")
+            return
+        except Exception as e:
+            print(f"Error loading cache: {e}. Rebuilding cache...")
+
+    # Rebuild the cache from the directory
+    known_face_encodings, known_face_names = build_known_faces()
+    save_known_faces(known_face_encodings, known_face_names)
+    print("Saved known faces to cache.")
 
 def enroll_new_person():
     global top, bottom, left, right
@@ -135,20 +172,17 @@ def enroll_new_person():
     cap.release()
     cv2.destroyAllWindows()
     print(f"Added 10 new images for {name}.")
+    # Rebuild the cache after enrolling a new person (force a rebuild)
+    load_known_faces(force_rebuild=True)
 
-def process_frame(frame, known_face_encodings, known_face_names):
-    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-
-    face_locations = face_recognition.face_locations(
-        rgb_small_frame,
-        model=FACE_DETECTION_MODEL
-    )
+def process_encodings(rgb_small_frame, face_locations, known_encodings, known_names):
+    """Heavy processing done in a separate thread"""
     face_encodings = face_recognition.face_encodings(
         rgb_small_frame,
         face_locations,
-        num_jitters=3
+        num_jitters=1  # Reduced from 3
     )
+
     face_landmarks_list = face_recognition.face_landmarks(
         rgb_small_frame,
         face_locations
@@ -156,29 +190,25 @@ def process_frame(frame, known_face_encodings, known_face_names):
 
     face_info = []
     for (encoding, landmarks) in zip(face_encodings, face_landmarks_list):
+        # Calculate liveness
         left_eye = landmarks['left_eye']
         right_eye = landmarks['right_eye']
         mouth = landmarks['top_lip'] + landmarks['bottom_lip']
-
         ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
         mar = mouth_aspect_ratio(mouth)
         liveness = "Real" if ear < EYE_AR_THRESHOLD and mar < MOUTH_AR_THRESHOLD else "Spoof"
 
+        # Calculate recognition
         name = "Unknown"
         confidence = None
-
-        if known_face_encodings:
-            face_distances = face_recognition.face_distance(known_face_encodings, encoding)
+        if known_encodings:
+            face_distances = face_recognition.face_distance(known_encodings, encoding)
             best_match_index = np.argmin(face_distances)
             min_distance = face_distances[best_match_index]
 
             if min_distance < RECOGNITION_THRESHOLD:
-                name = known_face_names[best_match_index]
+                name = known_names[best_match_index]
                 confidence = round((1 - min_distance) * 100)
-            else:
-                name = "Unknown"
-        else:
-            name = "Unknown (No registered faces)"
 
         face_info.append({
             'name': name,
@@ -186,63 +216,100 @@ def process_frame(frame, known_face_encodings, known_face_names):
             'liveness': liveness
         })
 
-    return face_locations, face_info
+    return face_info
 
-def recognition_thread(video_capture, known_face_encodings, known_face_names):
-    while True:
-        ret, frame = video_capture.read()
-        if not ret:
-            break
+def recognition_thread(video_capture):
+    global latest_face_info
 
-        frame = cv2.flip(frame, 1)
-        face_locations, face_info = process_frame(frame, known_face_encodings, known_face_names)
+    last_processed = 0
+    current_face_locations = []
+    future = None
+    try:
+        while True:
+            ret, frame = video_capture.read()
+            if not ret:
+                break
 
-        # Draw face boxes and labels
-        for (top, right, bottom, left), info in zip(face_locations, face_info):
-            top *= 4
-            right *= 4
-            bottom *= 4
-            left *= 4
-            color = (0, 255, 0) if info['liveness'] == "Real" else (0, 0, 255)
+            frame = cv2.flip(frame, 1)
+            display_frame = frame.copy()
 
-            # Create label text
-            if info['confidence'] is not None:
-                label = f"{info['name']} {info['confidence']}%"
-            else:
-                label = info['name']
+            # Always detect face locations (fast)
+            small_frame = cv2.resize(frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            current_face_locations = face_recognition.face_locations(
+                rgb_small_frame,
+                model=FACE_DETECTION_MODEL
+            )
 
-            # Draw bounding box and label
-            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
-            cv2.putText(frame, label, (left + 6, bottom - 6),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+            # Trigger full processing at intervals
+            if time.time() - last_processed > PROCESS_INTERVAL:
+                if future is None or future.done():
+                    # Submit new processing task
+                    future = encoding_executor.submit(
+                        process_encodings,
+                        rgb_small_frame,
+                        current_face_locations,
+                        known_face_encodings,
+                        known_face_names
+                    )
+                    last_processed = time.time()
 
-        # Display liveness status in corner
-        if face_info:
-            liveness_statuses = [f"{info['liveness']}" for info in face_info]
-            liveness_text = "Status: " + ", ".join(liveness_statuses)
-            cv2.putText(frame, liveness_text, (10, frame.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            # Update face info if available
+            if future and future.done():
+                with face_info_lock:
+                    latest_face_info = future.result()
+                future = None
 
-        cv2.imshow('Face Recognition System', frame)
+            # Draw real-time face boxes
+            for (top, right, bottom, left) in current_face_locations:
+                # Scale back up face locations
+                top = int(top * (1 / RESIZE_FACTOR))
+                right = int(right * (1 / RESIZE_FACTOR))
+                bottom = int(bottom * (1 / RESIZE_FACTOR))
+                left = int(left * (1 / RESIZE_FACTOR))
 
-        key = cv2.waitKey(1)
-        if key == ord('a'):
-            video_capture.release()
-            enroll_new_person()
-            video_capture = cv2.VideoCapture(0)
-            load_known_faces()
-        elif key in [ord('q'), 27]:
-            break
+                # Draw basic box (will be updated when info arrives)
+                cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 0), 2)
 
-    video_capture.release()
-    cv2.destroyAllWindows()
+            # Draw recognition info when available
+            with face_info_lock:
+                for (loc, info) in zip(current_face_locations, latest_face_info):
+                    top, right, bottom, left = loc
+                    top = int(top * (1 / RESIZE_FACTOR))
+                    right = int(right * (1 / RESIZE_FACTOR))
+                    bottom = int(bottom * (1 / RESIZE_FACTOR))
+                    left = int(left * (1 / RESIZE_FACTOR))
 
-# Initialize face database
-os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
-load_known_faces()
+                    color = (0, 255, 0) if info['liveness'] == "Real" else (0, 0, 255)
+                    label = f"{info['name']} {info['confidence']}%" if info['confidence'] else info['name']
 
-# Main recognition loop
-video_capture = cv2.VideoCapture(0)
-recognition_thread = Thread(target=recognition_thread, args=(video_capture, known_face_encodings, known_face_names))
-recognition_thread.start()
+                    # Update boxes with latest info
+                    cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
+                    cv2.rectangle(display_frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
+                    cv2.putText(display_frame, label, (left + 6, bottom - 6),
+                                cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 1)
+
+            cv2.imshow('Face Recognition System', display_frame)
+
+            key = cv2.waitKey(1)
+            if key == ord('a'):
+                video_capture.release()
+                enroll_new_person()
+                video_capture = cv2.VideoCapture(0)
+                # Force a rebuild of the cache after enrollment to update changes immediately
+                load_known_faces(force_rebuild=True)
+            elif key in [ord('q'), 27]:
+                break
+    finally:
+        video_capture.release()
+        cv2.destroyAllWindows()
+        #encoding_executor.shutdown()
+
+if __name__ == "__main__":
+    try:
+        os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+        load_known_faces(force_rebuild=True)
+        video_capture = cv2.VideoCapture(0)
+        recognition_thread(video_capture)
+    finally:
+        encoding_executor.shutdown()
