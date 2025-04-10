@@ -180,7 +180,7 @@ def process_encodings(rgb_small_frame, face_locations, known_encodings, known_na
     face_encodings = face_recognition.face_encodings(
         rgb_small_frame,
         face_locations,
-        num_jitters=1  # Reduced from 3
+        num_jitters=1
     )
 
     face_landmarks_list = face_recognition.face_landmarks(
